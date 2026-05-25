@@ -1,4 +1,5 @@
 import { model } from "@medusajs/framework/utils"
+import { AuthEmailVerificationToken } from "./auth-email-verification-token"
 import { AuthIdentity } from "./auth-identity"
 
 export const ProviderIdentity = model
@@ -9,6 +10,12 @@ export const ProviderIdentity = model
     auth_identity: model.belongsTo(() => AuthIdentity, {
       mappedBy: "provider_identities",
     }),
+    email_verification_tokens: model.hasMany(
+      () => AuthEmailVerificationToken,
+      {
+        mappedBy: "provider_identity",
+      }
+    ),
     user_metadata: model.json().nullable(),
     provider_metadata: model.json().nullable(),
   })
@@ -19,3 +26,6 @@ export const ProviderIdentity = model
       unique: true,
     },
   ])
+  .cascades({
+    delete: ["email_verification_tokens"],
+  })

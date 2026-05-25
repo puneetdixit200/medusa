@@ -13,6 +13,7 @@ import {
   ModuleJoinerConfig,
   ModulesSdkTypes,
 } from "@medusajs/framework/types"
+import crypto from "node:crypto"
 import {
   InjectTransactionManager,
   InjectManager,
@@ -22,6 +23,7 @@ import {
   generateEntityId,
 } from "@medusajs/framework/utils"
 import {
+  AuthEmailVerificationToken,
   AuthIdentity,
   AuthMfaFactor,
   AuthMfaRecoveryCode,
@@ -35,6 +37,7 @@ import AuthMfaProviderService from "./mfa-provider"
 type InjectedDependencies = {
   baseRepository: DAL.RepositoryService
   authIdentityService: ModulesSdkTypes.IMedusaInternalService<any>
+  authEmailVerificationTokenService: ModulesSdkTypes.IMedusaInternalService<any>
   authMfaFactorService: ModulesSdkTypes.IMedusaInternalService<any>
   authMfaRecoveryCodeService: ModulesSdkTypes.IMedusaInternalService<any>
   providerIdentityService: ModulesSdkTypes.IMedusaInternalService<any>
@@ -54,6 +57,9 @@ export default class AuthModuleService
   protected authIdentityService_: ModulesSdkTypes.IMedusaInternalService<
     InferEntityType<typeof AuthIdentity>
   >
+  protected authEmailVerificationTokenService_: ModulesSdkTypes.IMedusaInternalService<
+    InferEntityType<typeof AuthEmailVerificationToken>
+  >
   protected authMfaFactorService_: ModulesSdkTypes.IMedusaInternalService<
     InferEntityType<typeof AuthMfaFactor>
   >
@@ -71,6 +77,7 @@ export default class AuthModuleService
   constructor(
     {
       authIdentityService,
+      authEmailVerificationTokenService,
       authMfaFactorService,
       authMfaRecoveryCodeService,
       providerIdentityService,
@@ -87,6 +94,7 @@ export default class AuthModuleService
 
     this.baseRepository_ = baseRepository
     this.authIdentityService_ = authIdentityService
+    this.authEmailVerificationTokenService_ = authEmailVerificationTokenService
     this.authMfaFactorService_ = authMfaFactorService
     this.authMfaRecoveryCodeService_ = authMfaRecoveryCodeService
     this.authProviderService_ = authProviderService
@@ -167,11 +175,16 @@ export default class AuthModuleService
     authenticationData: AuthenticationInput
   ): Promise<AuthenticationResponse> {
     try {
-      return await this.authProviderService_.register(
+      const response = await this.authProviderService_.register(
         provider,
         authenticationData,
         this.getAuthIdentityProviderService(provider)
       )
+
+      return await this.applyEmailVerificationRequirement_(response, {
+        actor_type: authenticationData.actor_type,
+        auth_provider: provider,
+      })
     } catch (error) {
       return { success: false, error: error.message }
     }
@@ -265,7 +278,13 @@ export default class AuthModuleService
         this.getAuthIdentityProviderService(provider)
       )
 
-      return await this.applyMfaRequirement_(response, {
+      const emailVerificationResponse =
+        await this.applyEmailVerificationRequirement_(response, {
+          actor_type: authenticationData.actor_type,
+          auth_provider: provider,
+        })
+
+      return await this.applyMfaRequirement_(emailVerificationResponse, {
         actor_type: authenticationData.actor_type,
         auth_provider: provider,
       })
@@ -285,7 +304,13 @@ export default class AuthModuleService
         this.getAuthIdentityProviderService(provider)
       )
 
-      return await this.applyMfaRequirement_(response, {
+      const emailVerificationResponse =
+        await this.applyEmailVerificationRequirement_(response, {
+          actor_type: authenticationData.actor_type,
+          auth_provider: provider,
+        })
+
+      return await this.applyMfaRequirement_(emailVerificationResponse, {
         actor_type: authenticationData.actor_type,
         auth_provider: provider,
       })
@@ -624,6 +649,233 @@ export default class AuthModuleService
     }
   }
 
+  @InjectManager()
+  async createAuthEmailVerificationToken(
+    data: AuthTypes.CreateAuthEmailVerificationTokenDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.CreateAuthEmailVerificationTokenResponse> {
+    return await this.createAuthEmailVerificationToken_(data, sharedContext)
+  }
+
+  @InjectTransactionManager()
+  protected async createAuthEmailVerificationToken_(
+    data: AuthTypes.CreateAuthEmailVerificationTokenDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.CreateAuthEmailVerificationTokenResponse> {
+    const token = this.generateEmailVerificationToken_()
+
+    const createdToken = await this.authEmailVerificationTokenService_.create(
+      {
+        auth_identity_id: data.auth_identity_id,
+        provider_identity_id: data.provider_identity_id,
+        email: data.email,
+        token_hash: this.hashEmailVerificationToken_(token),
+        expires_at: data.expires_at,
+        used_at: null,
+        metadata: data.metadata ?? null,
+      },
+      sharedContext
+    )
+
+    return {
+      token,
+      email_verification_token:
+        await this.serializeEmailVerificationToken_(createdToken),
+    }
+  }
+
+  @InjectManager()
+  async requestAuthEmailVerification(
+    data: AuthTypes.RequestAuthEmailVerificationDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.RequestAuthEmailVerificationResponse> {
+    return await this.requestAuthEmailVerification_(data, sharedContext)
+  }
+
+  @InjectTransactionManager()
+  protected async requestAuthEmailVerification_(
+    data: AuthTypes.RequestAuthEmailVerificationDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.RequestAuthEmailVerificationResponse> {
+    const providerIdentity = await this.retrieveEmailVerificationProviderIdentity_(
+      data.provider,
+      data.email,
+      sharedContext
+    )
+
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        providerIdentity.provider_metadata ?? {},
+        "email_verified_at"
+      )
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "Email verification is not required"
+      )
+    }
+
+    if (providerIdentity.provider_metadata?.email_verified_at) {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "Email is already verified"
+      )
+    }
+
+    await this.invalidateAuthEmailVerificationTokens_(
+      providerIdentity.id,
+      sharedContext
+    )
+
+    const expiresAt = new Date(
+      Date.now() + this.getEmailVerificationTokenTtlMs_(data.ttl_seconds)
+    )
+    const { token } = await this.createAuthEmailVerificationToken_(
+      {
+        auth_identity_id: providerIdentity.auth_identity_id!,
+        provider_identity_id: providerIdentity.id,
+        email: providerIdentity.entity_id,
+        expires_at: expiresAt,
+        metadata: data.metadata ?? null,
+      },
+      sharedContext
+    )
+
+    return {
+      token,
+      email_verification: {
+        actor_type: data.actor_type ?? null,
+        provider: data.provider,
+        auth_identity_id: providerIdentity.auth_identity_id!,
+        provider_identity_id: providerIdentity.id,
+        email: providerIdentity.entity_id,
+        expires_at: expiresAt,
+        metadata: data.metadata ?? null,
+      },
+    }
+  }
+
+  @InjectManager()
+  async confirmAuthEmailVerification(
+    data: AuthTypes.ConfirmAuthEmailVerificationDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.ConfirmAuthEmailVerificationResponse> {
+    return await this.confirmAuthEmailVerification_(data, sharedContext)
+  }
+
+  @InjectTransactionManager()
+  protected async confirmAuthEmailVerification_(
+    data: AuthTypes.ConfirmAuthEmailVerificationDTO,
+    @MedusaContext() sharedContext: Context = {}
+  ): Promise<AuthTypes.ConfirmAuthEmailVerificationResponse> {
+    if (!data.token) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Email verification token is required"
+      )
+    }
+
+    const [verificationToken] =
+      await this.authEmailVerificationTokenService_.list(
+        {
+          token_hash: this.hashEmailVerificationToken_(data.token),
+        },
+        {},
+        sharedContext
+      )
+
+    if (!verificationToken || verificationToken.used_at) {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "Email verification token is invalid or already used"
+      )
+    }
+
+    if (new Date(verificationToken.expires_at).getTime() <= Date.now()) {
+      throw new MedusaError(
+        MedusaError.Types.NOT_ALLOWED,
+        "Email verification token has expired"
+      )
+    }
+
+    const providerIdentity = await this.providerIdentityService_.retrieve(
+      verificationToken.provider_identity_id,
+      {},
+      sharedContext
+    )
+    const verifiedAt = new Date(Date.now())
+
+    await this.providerIdentityService_.update(
+      {
+        id: providerIdentity.id,
+        provider_metadata: {
+          ...(providerIdentity.provider_metadata ?? {}),
+          email_verified_at:
+            providerIdentity.provider_metadata?.email_verified_at ??
+            verifiedAt.toISOString(),
+        },
+      },
+      sharedContext
+    )
+
+    await this.authEmailVerificationTokenService_.update(
+      {
+        id: verificationToken.id,
+        used_at: verifiedAt,
+      },
+      sharedContext
+    )
+
+    return {
+      email_verified: true,
+      auth_identity_id: verificationToken.auth_identity_id!,
+      provider_identity_id: verificationToken.provider_identity_id!,
+      email: verificationToken.email,
+    }
+  }
+
+  protected async applyEmailVerificationRequirement_(
+    response: AuthenticationResponse,
+    context: Pick<
+      AuthTypes.CreateAuthMfaChallengeDTO,
+      "actor_type" | "auth_provider"
+    >
+  ): Promise<AuthenticationResponse> {
+    if (!response.success || !response.authIdentity || response.location) {
+      return response
+    }
+
+    if (context.auth_provider !== "emailpass") {
+      return response
+    }
+
+    const providerIdentity = response.authIdentity.provider_identities?.find(
+      (providerIdentity) => providerIdentity.provider === context.auth_provider
+    )
+    const providerMetadata = providerIdentity?.provider_metadata ?? {}
+
+    if (
+      !providerIdentity ||
+      !Object.prototype.hasOwnProperty.call(
+        providerMetadata,
+        "email_verified_at"
+      ) ||
+      providerMetadata.email_verified_at
+    ) {
+      return response
+    }
+
+    return {
+      success: true,
+      email_verification_required: true,
+      email_verification: {
+        actor_type: context.actor_type ?? null,
+        provider: context.auth_provider,
+        email: providerIdentity.entity_id,
+      },
+    }
+  }
+
   protected async applyMfaRequirement_(
     response: AuthenticationResponse,
     context: Pick<
@@ -762,6 +1014,88 @@ export default class AuthModuleService
         `MFA challenge does not support method "${method}"`
       )
     }
+  }
+
+  protected async retrieveEmailVerificationProviderIdentity_(
+    provider: string,
+    email: string,
+    sharedContext: Context = {}
+  ): Promise<AuthTypes.ProviderIdentityDTO> {
+    const [providerIdentity] = await this.providerIdentityService_.list(
+      {
+        provider,
+        entity_id: email,
+      },
+      {},
+      sharedContext
+    )
+
+    if (!providerIdentity) {
+      throw new MedusaError(
+        MedusaError.Types.NOT_FOUND,
+        `ProviderIdentity with entity_id "${email}" was not found`
+      )
+    }
+
+    return await this.baseRepository_.serialize<AuthTypes.ProviderIdentityDTO>(
+      providerIdentity
+    )
+  }
+
+  protected async invalidateAuthEmailVerificationTokens_(
+    providerIdentityId: string,
+    sharedContext: Context = {}
+  ): Promise<void> {
+    const existingTokens = await this.authEmailVerificationTokenService_.list(
+      {
+        provider_identity_id: providerIdentityId,
+      },
+      { select: ["id", "used_at"] },
+      sharedContext
+    )
+    const tokenIds = existingTokens
+      .filter((token) => !token.used_at)
+      .map((token) => token.id)
+
+    if (tokenIds.length) {
+      await this.authEmailVerificationTokenService_.delete(
+        tokenIds,
+        sharedContext
+      )
+    }
+  }
+
+  protected async serializeEmailVerificationToken_(
+    token: InferEntityType<typeof AuthEmailVerificationToken>
+  ): Promise<AuthTypes.AuthEmailVerificationTokenDTO> {
+    const serialized = await this.baseRepository_.serialize<
+      AuthTypes.AuthEmailVerificationTokenDTO & {
+        token_hash?: string
+      }
+    >(token)
+
+    delete serialized.token_hash
+
+    return serialized
+  }
+
+  protected generateEmailVerificationToken_(): string {
+    return crypto.randomBytes(32).toString("base64url")
+  }
+
+  protected hashEmailVerificationToken_(token: string): string {
+    return crypto.createHash("sha256").update(token).digest("hex")
+  }
+
+  protected getEmailVerificationTokenTtlMs_(ttlSeconds = 86400): number {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Email verification token TTL must be a positive integer"
+      )
+    }
+
+    return ttlSeconds * 1000
   }
 
   protected getMfaChallengeConfig_(): {

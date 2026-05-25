@@ -6,6 +6,7 @@ jest.setTimeout(100000)
 
 describe("Email password auth provider", () => {
   let emailpassService: EmailPassAuthService
+  let verifyingEmailpassService: EmailPassAuthService
 
   beforeAll(() => {
     emailpassService = new EmailPassAuthService(
@@ -13,6 +14,14 @@ describe("Email password auth provider", () => {
         logger: console as any,
       },
       {}
+    )
+    verifyingEmailpassService = new EmailPassAuthService(
+      {
+        logger: console as any,
+      },
+      {
+        require_email_verification: true,
+      }
     )
   })
 
@@ -112,6 +121,134 @@ describe("Email password auth provider", () => {
               provider_metadata: {},
             }),
           ],
+        }),
+      })
+    )
+  })
+
+  it("marks new identities as unverified when email verification is required", async () => {
+    const authServiceSpies = {
+      retrieve: jest.fn().mockImplementation(() => {
+        throw new MedusaError(MedusaError.Types.NOT_FOUND, "Not found")
+      }),
+      create: jest.fn().mockImplementation((data) => {
+        return {
+          provider_identities: [
+            {
+              entity_id: data.entity_id,
+              provider: "emailpass",
+              provider_metadata: data.provider_metadata,
+            },
+          ],
+        }
+      }),
+    }
+
+    const resp = await verifyingEmailpassService.register(
+      { body: { email: "test@admin.com", password: "test" } },
+      authServiceSpies
+    )
+
+    expect(authServiceSpies.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider_metadata: expect.objectContaining({
+          password: expect.any(String),
+          email_verified_at: null,
+        }),
+      })
+    )
+    expect(resp.authIdentity?.provider_identities?.[0]).toEqual(
+      expect.objectContaining({
+        entity_id: "test@admin.com",
+        provider_metadata: {
+          email_verified_at: null,
+        },
+      })
+    )
+  })
+
+  it("returns unverified state after password authentication when configured", async () => {
+    const config = { logN: 15, r: 8, p: 1 }
+    const passwordHash = await Scrypt.kdf("somepass", config)
+
+    const authServiceSpies = {
+      retrieve: jest.fn().mockImplementation(() => {
+        return {
+          provider_identities: [
+            {
+              entity_id: "test@admin.com",
+              provider: "emailpass",
+              provider_metadata: {
+                password: passwordHash.toString("base64"),
+                email_verified_at: null,
+              },
+            },
+          ],
+        }
+      }),
+    }
+
+    const resp = await verifyingEmailpassService.authenticate(
+      { body: { email: "test@admin.com", password: "somepass" } },
+      authServiceSpies as any
+    )
+
+    expect(resp).toEqual(
+      expect.objectContaining({
+        success: true,
+        authIdentity: expect.objectContaining({
+          provider_identities: [
+            expect.objectContaining({
+              provider_metadata: {
+                email_verified_at: null,
+              },
+            }),
+          ],
+        }),
+      })
+    )
+  })
+
+  it("preserves email verification state when updating a password", async () => {
+    const authServiceSpies = {
+      retrieve: jest.fn().mockImplementation(() => {
+        return {
+          provider_identities: [
+            {
+              entity_id: "test@admin.com",
+              provider: "emailpass",
+              provider_metadata: {
+                password: "old-hash",
+                email_verified_at: "2026-05-25T10:00:00.000Z",
+              },
+            },
+          ],
+        }
+      }),
+      update: jest.fn().mockImplementation((_, data) => {
+        return {
+          provider_identities: [
+            {
+              entity_id: "test@admin.com",
+              provider: "emailpass",
+              provider_metadata: data.provider_metadata,
+            },
+          ],
+        }
+      }),
+    }
+
+    await emailpassService.update(
+      { entity_id: "test@admin.com", password: "updated" },
+      authServiceSpies as any
+    )
+
+    expect(authServiceSpies.update).toHaveBeenCalledWith(
+      "test@admin.com",
+      expect.objectContaining({
+        provider_metadata: expect.objectContaining({
+          password: expect.any(String),
+          email_verified_at: "2026-05-25T10:00:00.000Z",
         }),
       })
     )

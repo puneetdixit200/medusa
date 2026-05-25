@@ -25,6 +25,12 @@ import {
   UpdateProviderIdentityDTO,
   VerifyAuthMfaChallengeDTO,
   AuthMfaVerifyDTO,
+  ConfirmAuthEmailVerificationDTO,
+  ConfirmAuthEmailVerificationResponse,
+  CreateAuthEmailVerificationTokenDTO,
+  CreateAuthEmailVerificationTokenResponse,
+  RequestAuthEmailVerificationDTO,
+  RequestAuthEmailVerificationResponse,
 } from "./common"
 
 /**
@@ -382,6 +388,21 @@ export interface IAuthModuleService extends IModuleService {
     data: UseAuthMfaRecoveryCodeDTO,
     sharedContext?: Context
   ): Promise<void>
+
+  createAuthEmailVerificationToken(
+    data: CreateAuthEmailVerificationTokenDTO,
+    sharedContext?: Context
+  ): Promise<CreateAuthEmailVerificationTokenResponse>
+
+  requestAuthEmailVerification(
+    data: RequestAuthEmailVerificationDTO,
+    sharedContext?: Context
+  ): Promise<RequestAuthEmailVerificationResponse>
+
+  confirmAuthEmailVerification(
+    data: ConfirmAuthEmailVerificationDTO,
+    sharedContext?: Context
+  ): Promise<ConfirmAuthEmailVerificationResponse>
 
   /**
    * This method retrieves an auth identity by its ID.

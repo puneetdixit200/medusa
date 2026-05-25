@@ -1,4 +1,5 @@
 import { AuthIdentityDTO } from "./auth-identity"
+import { AuthEmailVerification } from "./email-verification"
 import { AuthMfaChallengeDTO } from "./mfa"
 
 /**
@@ -21,6 +22,16 @@ export type AuthenticationResponse = {
    * The multi-factor authentication (MFA) challenge to complete before issuing a token.
    */
   mfa_challenge?: AuthMfaChallengeDTO
+
+  /**
+   * Email verification details to complete before issuing a token.
+   */
+  email_verification_required?: boolean
+
+  /**
+   * The email verification state to show to the caller.
+   */
+  email_verification?: AuthEmailVerification
 
   /**
    * If an error occurs during the authentication process,

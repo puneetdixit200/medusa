@@ -4,4 +4,6 @@ export interface EmailPassAuthProviderOptions {
     r: number
     p: number
   }
+  require_email_verification?: boolean
+  verification_token_ttl_seconds?: number
 }
